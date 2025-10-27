@@ -1,349 +1,306 @@
-import React, { useMemo, useState } from "react";
-import { motion } from "framer-motion";
-import { Slider } from "@/components/ui/slider";
-import { Card, CardContent } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Info, Server, Wallet, Sparkles, Scissors, ExternalLink } from "lucide-react";
-
-// -------------------------------
-// Helper Types & Data
-// -------------------------------
-
-type NodeType = {
-  name: string;
-  vcpu: number;
-  memoryGiB: number;
-  hourlyUSD: number; // editable by user
-};
-
-type Provider = {
-  id: "aws" | "gcp" | "azure";
-  label: string;
-  region: string;
-  nodeTypes: NodeType[];
-};
-
-const defaultProviders: Provider[] = [
-  {
-    id: "aws",
-    label: "AWS EKS",
-    region: "eu-central-1 (Frankfurt)",
-    nodeTypes: [
-      { name: "m6i.large", vcpu: 2, memoryGiB: 8, hourlyUSD: 0.111 },
-      { name: "m6i.xlarge", vcpu: 4, memoryGiB: 16, hourlyUSD: 0.222 },
-      { name: "m6i.2xlarge", vcpu: 8, memoryGiB: 32, hourlyUSD: 0.444 },
-      { name: "r6i.xlarge", vcpu: 4, memoryGiB: 32, hourlyUSD: 0.302 },
-    ],
-  },
-  {
-    id: "gcp",
-    label: "Google GKE",
-    region: "europe-west1 (Belgium)",
-    nodeTypes: [
-      { name: "n2-standard-2", vcpu: 2, memoryGiB: 8, hourlyUSD: 0.106 },
-      { name: "n2-standard-4", vcpu: 4, memoryGiB: 16, hourlyUSD: 0.214 },
-      { name: "n2-standard-8", vcpu: 8, memoryGiB: 32, hourlyUSD: 0.427 },
-      { name: "n2-highmem-4", vcpu: 4, memoryGiB: 32, hourlyUSD: 0.287 },
-    ],
-  },
-  {
-    id: "azure",
-    label: "Azure AKS",
-    region: "westeurope (Netherlands)",
-    nodeTypes: [
-      { name: "D2s_v5", vcpu: 2, memoryGiB: 8, hourlyUSD: 0.096 },
-      { name: "D4s_v5", vcpu: 4, memoryGiB: 16, hourlyUSD: 0.192 },
-      { name: "D8s_v5", vcpu: 8, memoryGiB: 32, hourlyUSD: 0.384 },
-      { name: "E4as_v5", vcpu: 4, memoryGiB: 32, hourlyUSD: 0.248 },
-    ],
-  },
-];
-
-// -------------------------------
-// Small utilities
-// -------------------------------
-
-function ceilDiv(a: number, b: number) {
-  return Math.ceil(a / b);
-}
-
-function fmtUSD(n: number) {
-  return n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 4 });
-}
-
-// Pack memory using simple first-fit: just divide total by allocatable per node
-function packNodes(totalMemGiB: number, nodeMemGiB: number) {
-  if (nodeMemGiB <= 0) return Number.POSITIVE_INFINITY;
-  return ceilDiv(totalMemGiB, nodeMemGiB);
-}
-
-// Given a provider catalog, choose the cheapest node plan to satisfy memory
-function bestPlanByMemory(totalMemGiB: number, allocatablePct: number, catalog: NodeType[]) {
-  let best = null as null | { node: NodeType; count: number; hourlyCost: number; allocMemPerNode: number };
-  for (const n of catalog) {
-    const allocPerNode = n.memoryGiB * allocatablePct;
-    const count = packNodes(totalMemGiB, allocPerNode);
-    const cost = count * n.hourlyUSD;
-    if (!best || cost < best.hourlyCost) best = { node: n, count, hourlyCost: cost, allocMemPerNode: allocPerNode };
-  }
-  return best!;
-}
-
-const HOURS_PER_MONTH = 730; // cloud pricing convention (~365*24/12)
-const HOURS_PER_YEAR = 8760; // 365*24
-
-export default function App() {
-  // Inputs
-  const [replicas, setReplicas] = useState(12);
-  const [startupGiB, setStartupGiB] = useState(2);
-  const [steadyGiB, setSteadyGiB] = useState(0.75);
-  const [warmupMin, setWarmupMin] = useState(5);
-  const [allocatablePct, setAllocatablePct] = useState(0.85); // allocatable after kube/system overhead
-
-  const [providers, setProviders] = useState<Provider[]>(defaultProviders);
-
-  const totalStartup = useMemo(() => replicas * startupGiB, [replicas, startupGiB]);
-  const totalSteady = useMemo(() => replicas * steadyGiB, [replicas, steadyGiB]);
-
-  const results = useMemo(() => {
-    return providers.map((p) => {
-      const before = bestPlanByMemory(totalStartup, allocatablePct, p.nodeTypes);
-      const after = bestPlanByMemory(totalSteady, allocatablePct, p.nodeTypes);
-      const warmupFraction = Math.min(Math.max(warmupMin / 60, 0), 1);
-      const blended = before.hourlyCost * warmupFraction + after.hourlyCost * (1 - warmupFraction);
-      const savingsHourly = before.hourlyCost - blended; // per user's wording: "saving hourly"
-      const savingsPct = before.hourlyCost > 0 ? (savingsHourly / before.hourlyCost) * 100 : 0;
-      const savingsMonthly = savingsHourly * HOURS_PER_MONTH;
-      const savingsYearly = savingsHourly * HOURS_PER_YEAR;
-      return { provider: p, before, after, blended, savingsHourly, savingsMonthly, savingsYearly, savingsPct };
-    });
-  }, [providers, totalStartup, totalSteady, allocatablePct, warmupMin]);
-
-  // Handlers to edit price inline
-  const updateNodePrice = (pid: Provider["id"], name: string, price: number) => {
-    setProviders((prev) =>
-      prev.map((p) =>
-        p.id !== pid
-          ? p
-          : { ...p, nodeTypes: p.nodeTypes.map((n) => (n.name === name ? { ...n, hourlyUSD: price } : n)) }
-      )
-    );
-  };
-
-  const updateNodeMem = (pid: Provider["id"], name: string, mem: number) => {
-    setProviders((prev) =>
-      prev.map((p) =>
-        p.id !== pid
-          ? p
-          : { ...p, nodeTypes: p.nodeTypes.map((n) => (n.name === name ? { ...n, memoryGiB: mem } : n)) }
-      )
-    );
-  };
-
-  return (
-    <div className="min-h-screen w-full bg-gradient-to-b from-slate-50 to-white text-slate-900 p-6">
-      <div className="max-w-6xl mx-auto space-y-6">
-        <header className="flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <img src="/kedify-logo.png" alt="Kedify Logo" className="h-10" />
-            <div>
-              <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2"><Sparkles className="h-7 w-7"/>Kedify PodResourceProfile Savings Calculator</h1>
-              <p className="text-slate-600 mt-1">Estimate cost savings from vertically scaling pods after startup using Kubernetes 1.33+ in‑place resizes, with Karpenter consolidation.</p>
-              <div className="flex gap-4 mt-2 text-sm">
-                <a href="https://docs.kedify.io/features/pod-resource-profiles/" target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-indigo-600 hover:underline">
-                  <ExternalLink className="h-3 w-3" />PodResourceProfile Docs
-                </a>
-                <a href="https://kedify.io/resources/blog/kubernetes-vertical-autoscaling" target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-indigo-600 hover:underline">
-                  <ExternalLink className="h-3 w-3" />Blog: Kubernetes Vertical Autoscaling
-                </a>
-              </div>
-            </div>
-          </div>
-        </header>
-
-        {/* Controls */}
-        <Card className="shadow-sm rounded-2xl">
-          <CardContent className="p-6 grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div className="space-y-5">
-              <div>
-                <label className="text-sm font-medium flex items-center gap-2"><Server className="h-4 w-4"/>Replicas</label>
-                <div className="flex items-center gap-4 mt-2">
-                  <Slider value={[replicas]} min={1} max={500} step={1} onValueChange={(v)=>setReplicas(v[0])} className="w-full"/>
-                  <Input type="number" className="w-24" value={replicas} onChange={(e)=>setReplicas(parseInt(e.target.value||"0"))}/>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-sm font-medium">Startup memory (GiB)</label>
-                  <Input type="number" min={0} step={0.1} value={startupGiB} onChange={(e)=>setStartupGiB(parseFloat(e.target.value||"0"))}/>
-                </div>
-                <div>
-                  <label className="text-sm font-medium">Steady memory (GiB)</label>
-                  <Input type="number" min={0} step={0.05} value={steadyGiB} onChange={(e)=>setSteadyGiB(parseFloat(e.target.value||"0"))}/>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-sm font-medium">Warmup duration (minutes)</label>
-                  <Input type="number" min={0} step={1} value={warmupMin} onChange={(e)=>setWarmupMin(parseInt(e.target.value||"0"))}/>
-                </div>
-                <div>
-                  <label className="text-sm font-medium">Allocatable fraction</label>
-                  <div className="flex items-center gap-2">
-                    <Input type="number" min={0.5} max={0.98} step={0.01} value={allocatablePct} onChange={(e)=>setAllocatablePct(parseFloat(e.target.value||"0.85"))}/>
-                    <span className="text-sm text-slate-500">(e.g. 0.85 for 15% system overhead)</span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="text-sm text-slate-600 flex items-start gap-2">
-                <Info className="h-4 w-4 mt-0.5"/>
-                <span>
-                  Total startup footprint: <strong>{totalStartup.toFixed(2)} GiB</strong>, steady: <strong>{totalSteady.toFixed(2)} GiB</strong>. Costs blend {warmupMin}m at startup level and the rest at steady level.
-                </span>
-              </div>
-            </div>
-
-            <div className="rounded-xl bg-slate-50 p-4 space-y-3">
-              <h3 className="font-semibold">How it works</h3>
-              <ul className="list-disc pl-5 text-sm text-slate-600 space-y-2">
-                <li>We choose the cheapest node size in each provider catalog that can host your total memory, given <em>allocatable</em> memory per node.</li>
-                <li>Before shrink: pack <strong>startup</strong> memory; after shrink: pack <strong>steady</strong> memory. Karpenter consolidation is assumed to remove or replace nodes accordingly.</li>
-                <li>Blended hourly cost = (warmup/60) × before + (1 − warmup/60) × after.</li>
-                <li>All prices are editable and meant as placeholders. Enter your real blended node price if different (on‑demand, committed use, Spot, etc.).</li>
-              </ul>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Provider Tabs */}
-        <Tabs defaultValue="aws" className="w-full">
-          <TabsList className="grid grid-cols-3 w-full max-w-xl">
-            <TabsTrigger value="aws">AWS</TabsTrigger>
-            <TabsTrigger value="gcp">GCP</TabsTrigger>
-            <TabsTrigger value="azure">Azure</TabsTrigger>
-          </TabsList>
-
-          {results.map((r) => (
-            <TabsContent key={r.provider.id} value={r.provider.id}>
-              <ProviderCard
-                provider={r.provider}
-                before={r.before}
-                after={r.after}
-                blended={r.blended}
-                savingsHourly={r.savingsHourly}
-                savingsMonthly={r.savingsMonthly}
-                savingsYearly={r.savingsYearly}
-                savingsPct={r.savingsPct}
-                onEditPrice={updateNodePrice}
-                onEditMem={updateNodeMem}
-              />
-            </TabsContent>
-          ))}
-        </Tabs>
-
-        <footer className="text-xs text-slate-500">
-          <p>Tip: Adjust node prices to your contract (on‑demand, committed use, Savings Plans, Spot). This tool focuses on memory‑driven packing; add CPU constraints by extending the catalog and logic if needed.</p>
-        </footer>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Kedify PodResourceProfile Savings Calculator</title>
+  <meta name="description" content="Estimate cost savings from vertically scaling pods after startup using Kubernetes in-place resizes and Karpenter consolidation."/>
+  <style>
+    :root{
+      --bg:#f8fafc; --panel:#ffffff; --ink:#0f172a; --muted:#475569; --accent:#4f46e5; --ok:#059669; --bad:#b91c1c; --border:#e2e8f0; --chip:#eef2ff;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:linear-gradient(#f8fafc,#fff) fixed;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,Helvetica,Arial;color:var(--ink)}
+    .wrap{max-width:1100px;margin:0 auto;padding:24px}
+    header{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+    header img{height:40px}
+    h1{margin:0;font-size:26px;display:flex;gap:8px;align-items:center}
+    .muted{color:var(--muted)}
+    .links a{color:var(--accent);text-decoration:none;font-size:14px;margin-right:16px}
+    .links a:hover{text-decoration:underline}
+    .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;box-shadow:0 1px 2px rgba(15,23,42,.06);padding:16px}
+    .grid{display:grid;gap:16px}
+    .grid-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .grid-3{grid-template-columns:repeat(3,minmax(0,1fr))}
+    label{font-weight:600;font-size:14px}
+    input[type=number]{width:100%;padding:10px;border:1px solid var(--border);border-radius:10px;font-size:14px}
+    input[type=range]{width:100%}
+    .row{display:flex;gap:10px;align-items:center}
+    .pill{display:inline-block;background:var(--chip);padding:6px 10px;border-radius:999px;font-size:12px}
+    .small{font-size:12px;color:var(--muted)}
+    .title{font-weight:600}
+    .money{font-size:22px;font-weight:700}
+    .good{color:var(--ok)} .bad{color:var(--bad)}
+    .node{background:#f8fafc;border:1px solid var(--border);border-radius:12px;padding:12px}
+    .node .head{font-weight:600;margin-bottom:4px}
+    .twocol{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+    .tabs{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+    .tab{padding:8px 14px;border-radius:10px;background:#e2e8f0;color:#0f172a;cursor:pointer;border:1px solid transparent;user-select:none}
+    .tab.active{background:var(--accent);color:#fff}
+    .provider{margin-top:12px}
+    .hidden{display:none}
+    @media (max-width:860px){ .grid-2,.grid-3,.twocol{grid-template-columns:1fr} header{align-items:flex-start} }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <img src="logo.svg" alt="Kedify Logo" height="100px;" width="100px;" onerror="this.style.display='none'">
+    <br/><br/>
+    <header>
+      <div>
+        <h1>✨ Kedify PodResourceProfile Savings Calculator</h1>
+        <div class="muted" style="margin-top:4px">Estimate cost savings from vertically scaling pods after startup using PodResourceProfiles (Kubernetes in‑place resizes) together with Karpenter consolidation.</div>
+        <div class="links" style="margin-top:6px">
+          <a href="https://docs.kedify.io/features/pod-resource-profiles/" target="_blank" rel="noopener noreferrer">PodResourceProfile Docs ↗</a>
+          <a href="https://kedify.io/resources/blog/kubernetes-vertical-autoscaling" target="_blank" rel="noopener noreferrer">Blog: Kubernetes Vertical Autoscaling ↗</a>
+        </div>
       </div>
-    </div>
-  );
-}
+    </header>
 
-function ProviderCard({
-  provider,
-  before,
-  after,
-  blended,
-  savingsHourly,
-  savingsMonthly,
-  savingsYearly,
-  savingsPct,
-  onEditPrice,
-  onEditMem,
-}: {
-  provider: Provider;
-  before: { node: NodeType; count: number; hourlyCost: number; allocMemPerNode: number };
-  after: { node: NodeType; count: number; hourlyCost: number; allocMemPerNode: number };
-  blended: number;
-  savingsHourly: number;
-  savingsMonthly: number;
-  savingsYearly: number;
-  savingsPct: number;
-  onEditPrice: (pid: Provider["id"], name: string, price: number) => void;
-  onEditMem: (pid: Provider["id"], name: string, mem: number) => void;
-}) {
-  const savingColor = savingsHourly >= 0 ? "text-emerald-600" : "text-rose-600";
-  return (
-    <Card className="shadow-sm rounded-2xl">
-      <CardContent className="p-6 space-y-6">
-        <div className="flex items-center justify-between">
+    <!-- Controls -->
+    <section class="panel grid grid-2">
+      <div class="grid" style="align-content:start">
+        <div>
+          <label>Replicas</label>
+          <div class="row">
+            <input id="replicasRange" type="range" min="1" max="500" step="1">
+            <input id="replicas" type="number" min="1" step="1" style="width:120px">
+          </div>
+        </div>
+
+        <div class="grid grid-2">
           <div>
-            <h3 className="text-xl font-semibold flex items-center gap-2"><Scissors className="h-5 w-5"/> {provider.label} <span className="text-slate-500 text-sm">— {provider.region}</span></h3>
+            <label>Startup memory (GiB)</label>
+            <input id="startup" type="number" step="0.1" min="0">
           </div>
-          <div className="text-right">
-            <div className="text-sm text-slate-600">Saving hourly</div>
-            <div className={`text-2xl font-bold ${savingColor}`}>{fmtUSD(savingsHourly)}</div>
-            <div className="text-sm text-slate-600 mt-2">Saving monthly</div>
-            <div className={`text-lg font-semibold ${savingColor}`}>{fmtUSD(savingsMonthly)}</div>
-            <div className="text-sm text-slate-600 mt-2">Saving yearly</div>
-            <div className={`text-lg font-semibold ${savingColor}`}>{fmtUSD(savingsYearly)}</div>
-            <div className={`text-sm mt-2 ${savingColor}`}>{savingsHourly >= 0 ? "Savings" : "Increase"}: {savingsPct.toFixed(1)}%</div>
+          <div>
+            <label>Steady memory (GiB)</label>
+            <input id="steady" type="number" step="0.05" min="0">
           </div>
         </div>
 
-        <div className="grid md:grid-cols-2 gap-4">
-          <PlanPanel title="Before shrink (startup)" plan={before} accent="before" />
-          <PlanPanel title="After shrink (steady)" plan={after} accent="after" />
-        </div>
-
-        <div className="rounded-xl border p-4">
-          <h4 className="font-medium mb-3">Node catalog (edit prices or memory if needed)</h4>
-          <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-3">
-            {provider.nodeTypes.map((n) => (
-              <div key={n.name} className="rounded-xl bg-slate-50 p-3 space-y-2">
-                <div className="font-medium">{n.name}</div>
-                <div className="text-sm text-slate-600">{n.vcpu} vCPU • {n.memoryGiB} GiB RAM</div>
-                <div className="flex items-center gap-2 text-sm">
-                  <span className="text-slate-500">$/h</span>
-                  <Input type="number" step={0.001} value={n.hourlyUSD}
-                    onChange={(e)=>onEditPrice(provider.id, n.name, parseFloat(e.target.value||"0"))}/>
-                </div>
-                <div className="flex items-center gap-2 text-sm">
-                  <span className="text-slate-500">Mem (GiB)</span>
-                  <Input type="number" step={0.5} value={n.memoryGiB}
-                    onChange={(e)=>onEditMem(provider.id, n.name, parseFloat(e.target.value||"0"))}/>
-                </div>
-              </div>
-            ))}
+        <div class="grid grid-2">
+          <div>
+            <label>Warmup duration (minutes)</label>
+            <input id="warmup" type="number" step="1" min="0">
+          </div>
+          <div>
+            <label>Allocatable fraction</label>
+            <input id="alloc" type="number" step="0.01" min="0.5" max="0.98">
+            <div class="small">Example: 0.85 ≈ 15% system overhead</div>
           </div>
         </div>
-      </CardContent>
-    </Card>
-  );
-}
 
-function PlanPanel({ title, plan, accent }: { title: string; plan: { node: NodeType; count: number; hourlyCost: number; allocMemPerNode: number }; accent: "before"|"after" }) {
-  return (
-    <div className="rounded-xl border p-4">
-      <div className="flex items-center justify-between mb-2">
-        <div className="font-medium">{title}</div>
-        <div className="text-sm text-slate-600 flex items-center gap-1"><Wallet className="h-4 w-4"/> {fmtUSD(plan.hourlyCost)}/h</div>
+        <div class="small"><span id="footprint"></span></div>
       </div>
-      <div className="grid grid-cols-2 gap-2 text-sm">
-        <div className="rounded-lg bg-slate-50 p-3">
-          <div className="text-slate-500">Recommended nodes</div>
-          <div className="font-semibold">{plan.count} × {plan.node.name}</div>
-        </div>
-        <div className="rounded-lg bg-slate-50 p-3">
-          <div className="text-slate-500">Allocatable per node</div>
-          <div className="font-semibold">{plan.allocMemPerNode.toFixed(1)} GiB</div>
-        </div>
+
+      <div class="panel" style="background:#f8fafc">
+        <div class="pill">How it works</div>
+        <ul class="small" style="margin-top:10px;line-height:1.45">
+          <li>Chooses the cheapest node size in each provider catalog that can host your total <b>memory</b>, given <i>allocatable</i> per node.</li>
+          <li>Before shrink packs <b>startup</b> memory; after shrink packs <b>steady</b> memory. Karpenter can consolidate nodes accordingly.</li>
+          <li>Blended hourly = (<i>warmup</i>/60) × before + (1 − <i>warmup</i>/60) × after.</li>
+          <li>Prices are placeholders — edit to your real on-demand/commit/Spot pricing below.</li>
+        </ul>
       </div>
-      <div className="text-xs text-slate-500 mt-2">We choose the cheapest option from the catalog by memory packing (simple division). For fine control, edit the catalog or add series you actually allow in NodePools.</div>
-    </div>
-  );
-}
+    </section>
+
+    <!-- Tabs -->
+    <div class="tabs" id="tabs"></div>
+
+    <!-- Provider panels -->
+    <section id="providers">
+      <div id="aws"   class="panel provider"></div>
+      <div id="gcp"   class="panel provider hidden"></div>
+      <div id="azure" class="panel provider hidden"></div>
+    </section>
+
+    <div class="small" style="margin-top:8px">Note: This calculator relies on Karpenter and its effective node allocation</div>
+    <img src="kedify-logo.png" style="float: right;" alt="Kedify Logo" height="65px;" width="50px;" onerror="this.style.display='none'">
+  </div>
+
+  <script>
+    // ---------- Constants ----------
+    const HOURS_PER_MONTH = 730; // typical cloud pricing convention
+    const HOURS_PER_YEAR  = 8760;
+
+    // ---------- Provider data (editable in UI) ----------
+    const providers = {
+      aws:   { label: "AWS EKS",    region: "eu-central-1 (Frankfurt)",
+               nodes: [ {name:"m6i.large", vcpu:2, mem:8,  price:0.111},
+                        {name:"m6i.xlarge", vcpu:4, mem:16, price:0.222},
+                        {name:"m6i.2xlarge", vcpu:8, mem:32, price:0.444},
+                        {name:"r6i.xlarge", vcpu:4, mem:32, price:0.302} ] },
+      gcp:   { label: "Google GKE", region: "europe-west1 (Belgium)",
+               nodes: [ {name:"n2-standard-2", vcpu:2, mem:8,  price:0.106},
+                        {name:"n2-standard-4", vcpu:4, mem:16, price:0.214},
+                        {name:"n2-standard-8", vcpu:8, mem:32, price:0.427},
+                        {name:"n2-highmem-4", vcpu:4, mem:32, price:0.287} ] },
+      azure: { label: "Azure AKS",  region: "westeurope (Netherlands)",
+               nodes: [ {name:"D2s_v5", vcpu:2, mem:8,  price:0.096},
+                        {name:"D4s_v5", vcpu:4, mem:16, price:0.192},
+                        {name:"D8s_v5", vcpu:8, mem:32, price:0.384},
+                        {name:"E4as_v5", vcpu:4, mem:32, price:0.248} ] },
+    };
+
+    // ---------- Helpers ----------
+    const $ = (id) => document.getElementById(id);
+    const usd = (n) => n.toLocaleString(undefined,{style:"currency",currency:"USD",maximumFractionDigits:4});
+    const ceilDiv = (a,b) => Math.ceil(a/b);
+
+    function bestPlanByMemory(totalMemGiB, allocPct, catalog){
+      let best = null;
+      for(const n of catalog){
+        const allocPerNode = n.mem * allocPct;
+        if (allocPerNode <= 0) continue;
+        const count = ceilDiv(totalMemGiB, allocPerNode);
+        const cost  = count * n.price;
+        if(!best || cost < best.hourlyCost) best = { node:n, count, hourlyCost:cost, allocPerNode };
+      }
+      return best;
+    }
+
+    // ---------- State + bindings ----------
+    const state = { replicas:12, startup:2, steady:0.75, warmup:5, alloc:0.85, activeTab:"aws" };
+
+    function bindControls(){
+      const rr = $("replicasRange"), rn = $("replicas");
+      rr.value = state.replicas; rn.value = state.replicas;
+      rr.addEventListener("input", e => { state.replicas = +e.target.value; rn.value = state.replicas; render(); });
+      rn.addEventListener("input", e => { state.replicas = Math.max(1, +e.target.value || 1); rr.value = state.replicas; render(); });
+
+      const ids = ["startup","steady","warmup","alloc"];
+      ids.forEach(id => {
+        const el = $(id);
+        el.value = state[id];
+        el.addEventListener("input", e => { state[id] = +e.target.value; render(); });
+      });
+    }
+
+    function buildTabs(){
+      const tabs = $("tabs");
+      tabs.innerHTML = "";
+      for(const key of Object.keys(providers)){
+        const t = document.createElement("div");
+        t.className = "tab" + (state.activeTab === key ? " active" : "");
+        t.textContent = key.toUpperCase();
+        t.addEventListener("click", () => { state.activeTab = key; switchTab(); });
+        tabs.appendChild(t);
+      }
+    }
+
+    function switchTab(){
+      document.querySelectorAll(".tab").forEach((el, i) => {
+        const keys = Object.keys(providers);
+        el.classList.toggle("active", keys[i] === state.activeTab);
+      });
+      for(const key of Object.keys(providers)){
+        $(key).classList.toggle("hidden", key !== state.activeTab);
+      }
+    }
+
+    // ---------- Rendering ----------
+    function render(){
+      // compute totals
+      const totalStartup = state.replicas * state.startup;
+      const totalSteady  = state.replicas * state.steady;
+      $("footprint").textContent = `Total startup: ${totalStartup.toFixed(2)} GiB • steady: ${totalSteady.toFixed(2)} GiB`;
+
+      // build cards for each provider
+      for(const [key, p] of Object.entries(providers)){
+        const before = bestPlanByMemory(totalStartup, state.alloc, p.nodes);
+        const after  = bestPlanByMemory(totalSteady,  state.alloc, p.nodes);
+        if(!before || !after){ $(key).innerHTML = "<div class='small'>No valid node options.</div>"; continue; }
+
+        const wf = Math.min(Math.max(state.warmup/60, 0), 1);
+        const blended = before.hourlyCost*wf + after.hourlyCost*(1-wf);
+        const savingsHourly = before.hourlyCost - blended;
+        const savingsMonthly = savingsHourly * HOURS_PER_MONTH;
+        const savingsYearly  = savingsHourly * HOURS_PER_YEAR;
+
+        const savingClass = savingsHourly >= 0 ? "good" : "bad";
+
+        $(key).innerHTML = `
+          <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start">
+            <div>
+              <div class="title" style="font-size:18px">${p.label} <span class="muted" style="font-weight:400">— ${p.region}</span></div>
+              <div class="small">Saving hourly</div>
+              <div class="money ${savingClass}">${usd(savingsHourly)}</div>
+              <div class="small" style="margin-top:6px">Saving monthly</div>
+              <div class="money ${savingClass}" style="font-size:18px">${usd(savingsMonthly)}</div>
+              <div class="small" style="margin-top:6px">Saving yearly</div>
+              <div class="money ${savingClass}" style="font-size:18px">${usd(savingsYearly)}</div>
+            </div>
+            <div class="twocol" style="min-width:280px">
+              ${planPanel("Before shrink (startup)", before)}
+              ${planPanel("After shrink (steady)",  after)}
+            </div>
+          </div>
+          <div class="small" style="margin-top:8px">Shrink action: <b>${before.count} × ${before.node.name}</b> → <b>${after.count} × ${after.node.name}</b></div>
+          <div style="height:12px"></div>
+          <div class="pill">Node catalog (edit $/h or RAM)</div>
+          <div class="grid grid-3" style="margin-top:10px">
+            ${catalogEditor(key, p.nodes)}
+          </div>
+        `;
+      }
+      switchTab();
+    }
+
+    function planPanel(title, plan){
+      return `
+        <div class="node">
+          <div class="head">${title}</div>
+          <div class="small">Cost: ${usd(plan.hourlyCost)}/h</div>
+          <div class="pill" style="margin-top:6px">${plan.count} × ${plan.node.name}</div>
+          <div class="small" style="margin-top:6px">Allocatable/node: ${plan.allocPerNode.toFixed(1)} GiB</div>
+        </div>
+      `;
+    }
+
+    function catalogEditor(providerKey, nodes){
+      return nodes.map((n, idx) => {
+        const pid = `${providerKey}-node-${idx}`;
+        return `
+          <div class="node">
+            <div class="head">${n.name}</div>
+            <div class="small">${n.vcpu||'?'} vCPU • <span id="${pid}-mem">${n.mem}</span> GiB RAM</div>
+            <div class="row small" style="margin-top:6px">
+              <span>$/h</span>
+              <input id="${pid}-price" type="number" step="0.001" value="${n.price}" style="width:120px">
+            </div>
+            <div class="row small" style="margin-top:6px">
+              <span>Mem (GiB)</span>
+              <input id="${pid}-memInput" type="number" step="0.5" value="${n.mem}" style="width:120px">
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function wireCatalogInputs(){
+      for(const [key, p] of Object.entries(providers)){
+        p.nodes.forEach((n, idx) => {
+          const priceEl = $(`${key}-node-${idx}-price`);
+          const memEl   = $(`${key}-node-${idx}-memInput`);
+          const memText = $(`${key}-node-${idx}-mem`);
+          if(priceEl){
+            priceEl.addEventListener("input", e => { n.price = +e.target.value; render(); wireCatalogInputs(); });
+          }
+          if(memEl){
+            memEl.addEventListener("input", e => { n.mem = +e.target.value; if(memText) memText.textContent = n.mem; render(); wireCatalogInputs(); });
+          }
+        });
+      }
+    }
+
+    // ---------- Init ----------
+    bindControls();
+    buildTabs();
+    render();
+    // Re-wire catalog inputs after first render because they are created dynamically
+    const observer = new MutationObserver(() => wireCatalogInputs());
+    observer.observe($("providers"), { childList:true, subtree:true });
+  </script>
+</body>
+</html>
