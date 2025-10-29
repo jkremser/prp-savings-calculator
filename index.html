@@ -39,6 +39,8 @@
     .tab.active{background:var(--accent);color:#fff}
     .provider{margin-top:12px}
     .hidden{display:none}
+    .logo-link{display:inline-block;transition:transform 0.3s ease}
+    .logo-link:hover{transform:scale(1.15)}
     @media (max-width:860px){ .grid-2,.grid-3,.twocol{grid-template-columns:1fr} header{align-items:flex-start} }
   </style>
 </head>
@@ -116,7 +118,9 @@
     </section>
 
     <div class="small" style="margin-top:8px">Note: This calculator relies on Karpenter and its effective node allocation</div>
-    <img src="kedify-logo.png" style="float: right;" alt="Kedify Logo" height="65px;" width="50px;" onerror="this.style.display='none'">
+    <a href="https://kedify.io" target="_blank" rel="noopener noreferrer" class="logo-link" style="float: right;">
+      <img src="kedify-logo.png" alt="Kedify Logo" height="65px;" width="50px;" onerror="this.style.display='none'">
+    </a>
   </div>
 
   <script>
